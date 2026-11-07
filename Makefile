@@ -20,7 +20,8 @@ blitz: $(SRC) config.h
 clean:
 	rm -f blitz *.o config.h
 
-install: blitz
+install: blitz blitz.desktop
 	install -D -m 755 blitz $(DESTDIR)$(BINDIR)/blitz
+	install -D -m 644 blitz.desktop $(DESTDIR)$(PREFIX)/share/wayland-sessions/blitz.desktop
 
 .PHONY: all clean install

@@ -430,6 +430,8 @@ do_fullscreen(void)
 	}
 }
 
+static void quit_compositor(void);
+
 static void
 action_handler(void *data, uint32_t time, uint32_t value, uint32_t state)
 {
@@ -479,7 +481,7 @@ action_handler(void *data, uint32_t time, uint32_t value, uint32_t state)
 		do_next_focus();
 		break;
 	case QUIT:
-		wl_display_terminate(g_dpy);
+		quit_compositor();
 		break;
 	}
 }
@@ -1056,12 +1058,26 @@ wallpaper_init(void)
 /* main (mirrors hevel): display -> init -> binds -> socket -> run      */
 /* ------------------------------------------------------------------ */
 
+/* Graceful shutdown. libwayland delivers Unix signals as event-loop events,
+ * never in async-signal context, so terminating the display here is safe.
+ * uwsm stops the session scope with SIGTERM on logout; this runs the exact
+ * same path as the Super+Shift+q QUIT action, letting wl_display_run()
+ * return so main() falls through to swc_finalize() and the VT is restored.
+ */
 static void
-on_signal(int s)
+quit_compositor(void)
 {
-	(void)s;
 	if (g_dpy != NULL)
 		wl_display_terminate(g_dpy);
+}
+
+static int
+on_signal(int signum, void *data)
+{
+	(void)signum;
+	(void)data;
+	quit_compositor();
+	return 0;
 }
 
 int
@@ -1088,8 +1104,10 @@ main(void)
 
 	wallpaper_init();
 
-	signal(SIGINT, on_signal);
-	signal(SIGTERM, on_signal);
+	if (wl_event_loop_add_signal(g_loop, SIGINT, on_signal, NULL) == NULL)
+		die("failed to watch SIGINT");
+	if (wl_event_loop_add_signal(g_loop, SIGTERM, on_signal, NULL) == NULL)
+		die("failed to watch SIGTERM");
 
 	wl_display_run(g_dpy);
 
