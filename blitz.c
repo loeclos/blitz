@@ -33,6 +33,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stddef.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -40,7 +41,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <swc.h>
@@ -1136,6 +1139,11 @@ wp_dispatch(int fd, uint32_t mask, void *data)
 	if ((mask & WL_EVENT_READABLE) != 0) {
 		if (wl_display_prepare_read(g_wp.dpy) == 0) {
 			if (wl_display_read_events(g_wp.dpy) < 0) {
+				fprintf(stderr,
+				    "blitz: wallpaper client read failed: %s "
+				    "(display error %d)\n",
+				    strerror(errno),
+				    wl_display_get_error(g_wp.dpy));
 				wp_disconnect("failed to read Wayland events");
 				return 0;
 			}
@@ -1218,6 +1226,51 @@ wallpaper_init(void)
 /* main (mirrors hevel): display -> init -> binds -> socket -> run      */
 /* ------------------------------------------------------------------ */
 
+/* uwsm readiness without libsystemd. systemd's notification protocol is a
+ * single datagram to $NOTIFY_SOCKET. uwsm's wayland-wm@.service is
+ * Type=notify with TimeoutStartSec=30: without READY=1 it terminates a
+ * healthy compositor 30s after launch, which looks exactly like a crash.
+ * Absolute paths and @abstract sockets are both supported; without
+ * $NOTIFY_SOCKET (plain swc-launch) this is a silent no-op. */
+static void
+notify_state(const char *msg)
+{
+	const char *sock = getenv("NOTIFY_SOCKET");
+	const char *name;
+	size_t len;
+	int fd;
+	struct sockaddr_un addr;
+	socklen_t addrlen;
+
+	if (sock == NULL || sock[0] == '\0' || msg == NULL || msg[0] == '\0')
+		return;
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family = AF_UNIX;
+	if (sock[0] == '@') {
+		name = sock + 1;
+		len = strlen(name);
+		if (len == 0 || len >= sizeof(addr.sun_path) - 1)
+			return;
+		memcpy(addr.sun_path + 1, name, len);
+		addrlen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) +
+		    1 + len);
+	} else {
+		len = strlen(sock);
+		if (len == 0 || len >= sizeof(addr.sun_path))
+			return;
+		memcpy(addr.sun_path, sock, len + 1);
+		addrlen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) +
+		    len);
+	}
+	fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return;
+	fcntl(fd, F_SETFD, FD_CLOEXEC);
+	sendto(fd, msg, strlen(msg), MSG_NOSIGNAL,
+	    (const struct sockaddr *)&addr, addrlen);
+	close(fd);
+}
+
 /* Graceful shutdown. libwayland delivers Unix signals as event-loop events,
  * never in async-signal context, so terminating the display here is safe.
  * uwsm stops the session scope with SIGTERM on logout; this runs the exact
@@ -1227,6 +1280,7 @@ wallpaper_init(void)
 static void
 quit_compositor(void)
 {
+	notify_state("STOPPING=1");
 	if (g_dpy != NULL)
 		wl_display_terminate(g_dpy);
 }
@@ -1272,6 +1326,7 @@ main(void)
 		die("failed to watch SIGTERM");
 
 	fprintf(stderr, "blitz: entering event loop\n");
+	notify_state("READY=1");
 	wl_display_run(g_dpy);
 	fprintf(stderr, "blitz: event loop exited\n");
 
