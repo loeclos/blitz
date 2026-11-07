@@ -338,6 +338,7 @@ center_focused(void)
 {
 	struct blitz_win *bw = g_focused ? find_win(g_focused) : NULL;
 	struct blitz_screen *s = g_active ? g_active : first_screen();
+	struct swc_rectangle *area;
 	struct swc_rectangle wg;
 
 	if (bw == NULL || s == NULL)
@@ -346,9 +347,12 @@ center_focused(void)
 		return;
 	if (wg.width == 0 || wg.height == 0)
 		return;
-	pan_by(s->s->geometry.x + (int32_t)s->s->geometry.width / 2 -
+	area = &s->s->usable_geometry;
+	if (area->width == 0 || area->height == 0)
+		area = &s->s->geometry;
+	pan_by(area->x + (int32_t)area->width / 2 -
 	    (wg.x + (int32_t)wg.width / 2),
-	    s->s->geometry.y + (int32_t)s->s->geometry.height / 2 -
+	    area->y + (int32_t)area->height / 2 -
 	    (wg.y + (int32_t)wg.height / 2));
 }
 
@@ -372,16 +376,20 @@ do_spawn(const char *const *cmd)
 	if (cmd == NULL || cmd[0] == NULL)
 		return;
 	pid = fork();
-	if (pid < 0)
+	if (pid < 0) {
+		perror("blitz: fork");
 		return;
+	}
 	if (pid == 0) {
 		char *const *argv = (char *const *)cmd;
 
 		if (setsid() < 0)
 			_exit(127);
 		execvp(argv[0], argv);
+		perror("blitz: execvp");
 		_exit(127);
 	}
+	fprintf(stderr, "blitz: spawned %s (pid %ld)\n", cmd[0], (long)pid);
 }
 
 static void
@@ -441,6 +449,8 @@ action_handler(void *data, uint32_t time, uint32_t value, uint32_t state)
 	(void)value;
 	if (b == NULL || state != WL_KEYBOARD_KEY_STATE_PRESSED)
 		return;
+	fprintf(stderr, "blitz: action=%u keysym=0x%x\n",
+	    (unsigned)b->action, b->keysym);
 	switch (b->action) {
 	case SPAWN:
 		do_spawn(b->cmd);
@@ -538,18 +548,26 @@ static void
 setup_binds(void)
 {
 	size_t i;
+	int ret;
 
 	for (i = 0; i < LENGTH(blitz_binds); i++) {
 		const struct blitz_bind *b = &blitz_binds[i];
 
-		swc_add_binding(SWC_BINDING_KEY, b->mods, b->keysym,
+		ret = swc_add_binding(SWC_BINDING_KEY, b->mods, b->keysym,
 		    action_handler, (void *)b);
+		if (ret < 0)
+			fprintf(stderr, "blitz: cannot register key binding "
+			    "keysym=0x%x (%d)\n", b->keysym, ret);
 	}
 	/* mouse binds are hardcoded, never remapped through the table */
-	swc_add_binding(SWC_BINDING_BUTTON, blitz_mod, BTN_LEFT, button_move,
-	    NULL);
-	swc_add_binding(SWC_BINDING_BUTTON, blitz_mod, BTN_RIGHT, button_resize,
-	    NULL);
+	ret = swc_add_binding(SWC_BINDING_BUTTON, blitz_mod, BTN_LEFT,
+	    button_move, NULL);
+	if (ret < 0)
+		fprintf(stderr, "blitz: cannot register move binding (%d)\n", ret);
+	ret = swc_add_binding(SWC_BINDING_BUTTON, blitz_mod, BTN_RIGHT,
+	    button_resize, NULL);
+	if (ret < 0)
+		fprintf(stderr, "blitz: cannot register resize binding (%d)\n", ret);
 }
 
 /* ------------------------------------------------------------------ */
@@ -602,11 +620,14 @@ new_window(struct swc_window *w)
 	int32_t x = 0, y = 0;
 
 	bw = calloc(1, sizeof(*bw));
-	if (bw == NULL)
+	if (bw == NULL) {
+		fprintf(stderr, "blitz: out of memory managing new window\n");
 		return;
+	}
 	bw->w = w;
 	bw->fullscreen = false;
 	wl_list_insert(&g_wins, &bw->link);
+	fprintf(stderr, "blitz: new window callback %p\n", (void *)w);
 	swc_window_set_handler(w, &win_handler, bw);
 	swc_window_set_stacked(w);
 	swc_window_set_border(w, border_color_inactive, border_width, 0, 0);
@@ -614,6 +635,8 @@ new_window(struct swc_window *w)
 		swc_window_set_position(w, x, y);
 	swc_window_show(w);
 	focus_window(w, true);
+	fprintf(stderr, "blitz: mapped window %p (%s)\n", (void *)w,
+	    w->title ? w->title : "untitled");
 }
 
 static void
@@ -671,37 +694,43 @@ static const struct swc_manager manager = {
 /* bind at v1 and only use requests that exist since v1.               */
 /* ------------------------------------------------------------------ */
 
-static const struct wl_interface *bl_ls_types[] = { NULL, NULL, NULL, NULL };
-static const struct wl_interface *bl_get_types[] = { NULL, NULL, NULL, NULL,
-	NULL, NULL };
-
 /* forward declarations (each references the other) */
 static const struct wl_interface bl_layer_surface_iface;
 static const struct wl_interface bl_layer_shell_iface;
 
+/* get_layer_surface has a new_id plus typed surface/output objects. */
+static const struct wl_interface *bl_get_types[] = {
+	&bl_layer_surface_iface,
+	&wl_surface_interface,
+	&wl_output_interface,
+	NULL,
+	NULL,
+};
+
 static const struct wl_message bl_layer_shell_reqs[] = {
-	{ "get_layer_surface", "noous", bl_get_types + 1 },
+	{ "get_layer_surface", "no?ous", bl_get_types },
 };
 
 static const struct wl_message bl_layer_surface_reqs[] = {
-	{ "set_size", "uu", bl_ls_types },
-	{ "set_anchor", "u", bl_ls_types },
-	{ "set_exclusive_zone", "i", bl_ls_types },
-	{ "set_margin", "iiii", bl_ls_types },
-	{ "set_keyboard_interactivity", "u", bl_ls_types },
-	{ "ack_configure", "u", bl_ls_types + 3 },
-	{ "destroy", "", bl_ls_types },
+	{ "set_size", "uu", NULL },
+	{ "set_anchor", "u", NULL },
+	{ "set_exclusive_zone", "i", NULL },
+	{ "set_margin", "iiii", NULL },
+	{ "set_keyboard_interactivity", "u", NULL },
+	{ "get_popup", "o", NULL },
+	{ "ack_configure", "u", NULL },
+	{ "destroy", "", NULL },
 };
 
 static const struct wl_message bl_layer_surface_evs[] = {
-	{ "configure", "uuu", bl_ls_types },
-	{ "closed", "", bl_ls_types },
+	{ "configure", "uuu", NULL },
+	{ "closed", "", NULL },
 };
 
 static const struct wl_interface bl_layer_surface_iface = {
 	"zwlr_layer_surface_v1",
 	1,
-	7,
+	8,
 	bl_layer_surface_reqs,
 	2,
 	bl_layer_surface_evs,
@@ -1016,18 +1045,39 @@ static const struct wl_registry_listener wp_reg_listener = {
 static void
 wp_maybe_setup(void);
 
+static void
+wp_disconnect(const char *reason)
+{
+	fprintf(stderr, "blitz: wallpaper client disabled: %s\n", reason);
+	if (g_wp.fdsrc != NULL) {
+		wl_event_source_remove(g_wp.fdsrc);
+		g_wp.fdsrc = NULL;
+	}
+	if (g_wp.dpy != NULL) {
+		wl_display_disconnect(g_wp.dpy);
+		g_wp.dpy = NULL;
+	}
+}
+
 static int
 wp_dispatch(int fd, uint32_t mask, void *data)
 {
 	(void)fd;
 	(void)data;
+	if ((mask & (WL_EVENT_HANGUP | WL_EVENT_ERROR)) != 0) {
+		wp_disconnect("Wayland connection closed");
+		return 0;
+	}
 	if ((mask & WL_EVENT_READABLE) != 0) {
 		if (wl_display_prepare_read(g_wp.dpy) == 0) {
-			if (wl_display_read_events(g_wp.dpy) < 0)
+			if (wl_display_read_events(g_wp.dpy) < 0) {
+				wp_disconnect("failed to read Wayland events");
 				return 0;
-			wl_display_dispatch_pending(g_wp.dpy);
-		} else {
-			wl_display_dispatch_pending(g_wp.dpy);
+			}
+		}
+		if (wl_display_dispatch_pending(g_wp.dpy) < 0) {
+			wp_disconnect("Wayland protocol error");
+			return 0;
 		}
 		wl_display_flush(g_wp.dpy);
 	}
@@ -1093,7 +1143,8 @@ wallpaper_init(void)
 	wl_registry_add_listener(g_wp.reg, &wp_reg_listener, NULL);
 	wl_display_flush(g_wp.dpy);
 	g_wp.fdsrc = wl_event_loop_add_fd(g_loop, wl_display_get_fd(g_wp.dpy),
-	    WL_EVENT_READABLE, wp_dispatch, NULL);
+	    WL_EVENT_READABLE | WL_EVENT_HANGUP | WL_EVENT_ERROR,
+	    wp_dispatch, NULL);
 	if (g_wp.fdsrc == NULL)
 		fprintf(stderr, "blitz: wallpaper: cannot watch client fd\n");
 }
