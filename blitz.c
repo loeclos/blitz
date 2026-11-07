@@ -734,8 +734,12 @@ struct wallpaper {
 	struct wl_event_source *fdsrc;
 	uint32_t pending_serial;
 	bool have_configure;
+	bool setup_done; /* layer surface created (once) */
+	bool rendered; /* a buffer was attached at least once */
 	uint32_t width;
 	uint32_t height;
+	uint32_t rw; /* size of the attached buffer */
+	uint32_t rh;
 	unsigned char *img;
 	int img_w;
 	int img_h;
@@ -926,6 +930,9 @@ wp_render(uint32_t w, uint32_t h)
 	wl_surface_damage(g_wp.surf, 0, 0, (int32_t)w, (int32_t)h);
 	wl_surface_commit(g_wp.surf);
 	wl_display_flush(g_wp.dpy);
+	g_wp.rendered = true;
+	g_wp.rw = w;
+	g_wp.rh = h;
 }
 
 /* layer_surface.configure(serial, width, height) */
@@ -939,8 +946,12 @@ wp_configure(void *data, struct wl_proxy *proxy, uint32_t serial, uint32_t w,
 	g_wp.have_configure = true;
 	g_wp.width = w;
 	g_wp.height = h;
-	/* ack, then attach the wallpaper buffer */
+	/* ack every configure (required); re-render only when the size
+	 * actually changed, so a repeated configure can never turn into a
+	 * render/commit/configure storm that starves the event loop. */
 	wl_proxy_marshal(g_wp.lsurf, 6, serial);
+	if (g_wp.rendered && w == g_wp.rw && h == g_wp.rh)
+		return;
 	if (g_wp.img == NULL && wallpaper[0] != '\0') {
 		int iw = 0, ih = 0;
 
@@ -999,39 +1010,50 @@ static const struct wl_registry_listener wp_reg_listener = {
 	.global_remove = wp_global_remove,
 };
 
+/* Drain the wallpaper client connection without ever blocking: the fd
+ * source only fires when data is waiting, so prepare/read/pending is
+ * enough and a blocking dispatch can never stall the compositor loop. */
+static void
+wp_maybe_setup(void);
+
 static int
 wp_dispatch(int fd, uint32_t mask, void *data)
 {
 	(void)fd;
 	(void)data;
-	if ((mask & WL_EVENT_READABLE) != 0)
-		wl_display_dispatch(g_wp.dpy);
+	if ((mask & WL_EVENT_READABLE) != 0) {
+		if (wl_display_prepare_read(g_wp.dpy) == 0) {
+			if (wl_display_read_events(g_wp.dpy) < 0)
+				return 0;
+			wl_display_dispatch_pending(g_wp.dpy);
+		} else {
+			wl_display_dispatch_pending(g_wp.dpy);
+		}
+		wl_display_flush(g_wp.dpy);
+	}
+	wp_maybe_setup();
 	return 0;
 }
 
-/* connected after the compositor socket exists; driven by its event loop */
+/* Create the background layer surface once the registry has delivered
+ * wl_compositor, wl_shm and zwlr_layer_shell_v1. Runs from the event loop,
+ * never before it: a blocking roundtrip here would deadlock the compositor
+ * against itself, since nobody could answer it until wl_display_run(). */
 static void
-wallpaper_init(void)
+wp_maybe_setup(void)
 {
 	struct wl_region *region;
 
-	memset(&g_wp, 0, sizeof(g_wp));
-	g_wp.dpy = wl_display_connect(NULL);
-	if (g_wp.dpy == NULL) {
-		fprintf(stderr, "blitz: wallpaper: cannot connect (%s)\n",
-		    wallpaper);
+	if (g_wp.setup_done)
 		return;
-	}
-	g_wp.reg = wl_display_get_registry(g_wp.dpy);
-	wl_registry_add_listener(g_wp.reg, &wp_reg_listener, NULL);
-	wl_display_roundtrip(g_wp.dpy);
-	if (g_wp.comp == NULL || g_wp.shm == NULL || g_wp.shell == NULL) {
-		fprintf(stderr, "blitz: wallpaper: missing globals\n");
+	if (g_wp.comp == NULL || g_wp.shm == NULL || g_wp.shell == NULL)
 		return;
-	}
+	g_wp.setup_done = true;
 	g_wp.surf = wl_compositor_create_surface(g_wp.comp);
-	if (g_wp.surf == NULL)
+	if (g_wp.surf == NULL) {
+		fprintf(stderr, "blitz: wallpaper: cannot create surface\n");
 		return;
+	}
 	/* clicks fall through to windows below */
 	region = wl_compositor_create_region(g_wp.comp);
 	if (region != NULL) {
@@ -1041,8 +1063,10 @@ wallpaper_init(void)
 	/* get_layer_surface(surface, output=NULL, layer=background, ns) */
 	g_wp.lsurf = wl_proxy_marshal_constructor(g_wp.shell, 0,
 	    &bl_layer_surface_iface, g_wp.surf, NULL, 0, "blitz-wallpaper");
-	if (g_wp.lsurf == NULL)
+	if (g_wp.lsurf == NULL) {
+		fprintf(stderr, "blitz: wallpaper: cannot create layer surface\n");
 		return;
+	}
 	wl_proxy_add_listener(g_wp.lsurf, (void (**)(void))&wp_lsurf_listener,
 	    NULL);
 	wl_proxy_marshal(g_wp.lsurf, 1, 15u); /* anchor: all edges */
@@ -1050,8 +1074,28 @@ wallpaper_init(void)
 	wl_proxy_marshal(g_wp.lsurf, 0, 0u, 0u); /* size: compositor picks */
 	wl_surface_commit(g_wp.surf);
 	wl_display_flush(g_wp.dpy);
+	fprintf(stderr, "blitz: wallpaper surface created\n");
+}
+
+/* Connected after the compositor socket exists; the rest of the handshake
+ * is driven by the event loop (see wp_dispatch/wp_maybe_setup). */
+static void
+wallpaper_init(void)
+{
+	memset(&g_wp, 0, sizeof(g_wp));
+	g_wp.dpy = wl_display_connect(NULL);
+	if (g_wp.dpy == NULL) {
+		fprintf(stderr, "blitz: wallpaper: cannot connect (%s)\n",
+		    wallpaper);
+		return;
+	}
+	g_wp.reg = wl_display_get_registry(g_wp.dpy);
+	wl_registry_add_listener(g_wp.reg, &wp_reg_listener, NULL);
+	wl_display_flush(g_wp.dpy);
 	g_wp.fdsrc = wl_event_loop_add_fd(g_loop, wl_display_get_fd(g_wp.dpy),
 	    WL_EVENT_READABLE, wp_dispatch, NULL);
+	if (g_wp.fdsrc == NULL)
+		fprintf(stderr, "blitz: wallpaper: cannot watch client fd\n");
 }
 
 /* ------------------------------------------------------------------ */
@@ -1101,6 +1145,7 @@ main(void)
 	if (sock == NULL)
 		die("wl_display_add_socket_auto failed");
 	setenv("WAYLAND_DISPLAY", sock, 1);
+	fprintf(stderr, "blitz: display socket %s\n", sock);
 
 	wallpaper_init();
 
@@ -1109,7 +1154,9 @@ main(void)
 	if (wl_event_loop_add_signal(g_loop, SIGTERM, on_signal, NULL) == NULL)
 		die("failed to watch SIGTERM");
 
+	fprintf(stderr, "blitz: entering event loop\n");
 	wl_display_run(g_dpy);
+	fprintf(stderr, "blitz: event loop exited\n");
 
 	if (g_wp.img != NULL)
 		stbi_image_free(g_wp.img);
