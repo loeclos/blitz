@@ -31,6 +31,7 @@
 
 #define _POSIX_C_SOURCE 200809L
 
+#include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -368,12 +369,55 @@ zoom_by(float factor)
 /* actions                                                             */
 /* ------------------------------------------------------------------ */
 
+/* Mirror execvp(3) lookup so a missing program is reported in the parent
+ * (the child cannot report back after fork). Returns true if execvp has a
+ * chance of succeeding. */
+static bool
+cmd_ok(const char *const *cmd)
+{
+	const char *prog = cmd[0];
+	const char *path;
+	char buf[4096];
+	size_t len;
+
+	if (strchr(prog, '/') != NULL) {
+		if (access(prog, X_OK) == 0)
+			return true;
+		fprintf(stderr, "blitz: cannot spawn %s: %s\n", prog,
+		    strerror(errno));
+		return false;
+	}
+	path = getenv("PATH");
+	if (path == NULL || path[0] == '\0')
+		path = "/usr/bin:/bin";
+	for (;;) {
+		const char *sep = strchr(path, ':');
+		size_t dirlen = sep ? (size_t)(sep - path) : strlen(path);
+
+		if (dirlen + 1 + strlen(prog) + 1 <= sizeof(buf)) {
+			memcpy(buf, path, dirlen);
+			buf[dirlen] = '/';
+			len = dirlen + 1;
+			memcpy(buf + len, prog, strlen(prog) + 1);
+			if (access(buf, X_OK) == 0)
+				return true;
+		}
+		if (!sep)
+			break;
+		path = sep + 1;
+	}
+	fprintf(stderr, "blitz: cannot spawn %s: not found in PATH\n", prog);
+	return false;
+}
+
 static void
 do_spawn(const char *const *cmd)
 {
 	pid_t pid;
 
 	if (cmd == NULL || cmd[0] == NULL)
+		return;
+	if (!cmd_ok(cmd))
 		return;
 	pid = fork();
 	if (pid < 0) {
@@ -685,6 +729,27 @@ static const struct swc_manager manager = {
 	.new_screen = new_screen,
 	.new_window = new_window,
 };
+
+/* One compact block describing the effective configuration and every
+ * registered bind, so any run log is self-diagnosing. */
+static void
+log_config(void)
+{
+	size_t i;
+
+	fprintf(stderr,
+	    "blitz: term=%s menu=%s wallpaper='%s' mode=%u scroll=%d "
+	    "zoom=%.2f mod=0x%x binds=%zu\n",
+	    blitz_term[0] ? blitz_term[0] : "(null)",
+	    blitz_menu[0] ? blitz_menu[0] : "(null)", wallpaper,
+	    wallpaper_mode, scroll_step, (double)zoom_step, blitz_mod,
+	    LENGTH(blitz_binds));
+	for (i = 0; i < LENGTH(blitz_binds); i++) {
+		fprintf(stderr, "blitz: bind mods=0x%x keysym=0x%x action=%u\n",
+		    blitz_binds[i].mods, blitz_binds[i].keysym,
+		    (unsigned)blitz_binds[i].action);
+	}
+}
 
 /* ------------------------------------------------------------------ */
 /* wallpaper: in-process layer-shell client                            */
@@ -1191,6 +1256,7 @@ main(void)
 		die("swc_initialize failed");
 
 	setup_binds();
+	log_config();
 
 	sock = wl_display_add_socket_auto(g_dpy);
 	if (sock == NULL)
